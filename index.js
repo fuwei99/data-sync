@@ -415,32 +415,64 @@ function startAutoSync(interval) {
     
     // 设置新的定时任务
     const intervalMs = interval * 60 * 1000; // 转换为毫秒
-    console.log(`Setting up auto-sync every ${interval} minutes (${intervalMs}ms)`);
+    console.log(`[data-sync] Setting up auto-sync every ${interval} minutes (${intervalMs}ms)`);
     
     syncInterval = setInterval(async () => {
-        console.log('Auto-sync triggered');
+        console.log('[data-sync] Auto-sync triggered');
+        let pullSuccess = false;
         try {
-            // 先拉取，再推送
-            const pullResult = await syncFromRemote();
+            // 1. 先尝试 Pull
+            console.log('[data-sync] Auto-sync: Attempting pull...');
+            const pullResult = await syncFromRemote(); // Uses pull internally now
+
             if (pullResult.success) {
-                console.log('Auto-sync: Pull successful');
-                
+                console.log('[data-sync] Auto-sync: Pull successful');
+                pullSuccess = true;
+            } else {
+                // 检查 Pull 失败是否因为合并冲突
+                const stderr = pullResult.stderr || pullResult.error || '';
+                if (stderr.toLowerCase().includes('merge conflict') || stderr.toLowerCase().includes('automatic merge failed')) {
+                    console.warn('[data-sync] Auto-sync: Pull failed due to merge conflict. Aborting merge attempt...');
+                    try {
+                        const abortResult = await runGitCommand('git merge --abort');
+                        if (abortResult.success) {
+                            console.log('[data-sync] Auto-sync: Merge aborted successfully.');
+                        } else {
+                            console.error('[data-sync] Auto-sync: Failed to abort merge after conflict:', abortResult.stderr || abortResult.error);
+                            // If abort fails, maybe try reset? Or just log and skip push.
+                            // console.warn('[data-sync] Auto-sync: Attempting git reset --hard HEAD as fallback...');
+                            // await runGitCommand('git reset --hard HEAD'); 
+                        }
+                    } catch (abortError) {
+                        console.error('[data-sync] Auto-sync: Error occurred while trying to abort merge:', abortError);
+                    }
+                    // 即使 abort 失败，也跳过 push
+                    console.log('[data-sync] Auto-sync: Skipping push due to merge conflict during pull.');
+                } else {
+                    // 其他 Pull 失败原因 (网络, 认证等)
+                    console.error('[data-sync] Auto-sync: Pull failed (non-conflict):', pullResult.message, pullResult.details || stderr);
+                    console.log('[data-sync] Auto-sync: Skipping push due to non-conflict pull error.');
+                }
+                 // Pull 失败，不进行 Push
+                 pullSuccess = false;
+            }
+
+            // 2. 如果 Pull 成功，再尝试 Push
+            if (pullSuccess) {
+                console.log('[data-sync] Auto-sync: Attempting push...');
                 const pushResult = await syncToRemote();
                 if (pushResult.success) {
-                    console.log('Auto-sync: Push successful');
-                    
+                    console.log('[data-sync] Auto-sync: Push successful');
                     // 更新最后同步时间
                     const config = await readConfig();
                     config.last_sync = new Date().toISOString();
                     await saveConfig(config);
                 } else {
-                    console.error('Auto-sync: Push failed', pushResult);
+                    console.error('[data-sync] Auto-sync: Push failed:', pushResult.message, pushResult.details || pushResult.stderr);
                 }
-            } else {
-                console.error('Auto-sync: Pull failed', pullResult);
             }
         } catch (error) {
-            console.error('Auto-sync error:', error);
+            console.error('[data-sync] Auto-sync: General error during cycle:', error);
         }
     }, intervalMs);
 }
@@ -584,31 +616,36 @@ async function init(router) {
     // API端点 - 同步到远程（上传） - 路径修正
     router.post('/git/sync/push', async (req, res) => {
         try {
-            console.log('收到同步到远程请求');
-            const result = await syncToRemote(); // syncToRemote now internally calls runGitCommand
-            
+            console.log('收到同步到远程请求 (手动)');
+            const result = await syncToRemote(); // Uses add, commit, push
+
             if (result.success) {
                 const config = await readConfig();
                 config.last_sync = new Date().toISOString();
                 await saveConfig(config);
                 res.json({ success: true, message: '同步到远程成功' });
             } else {
-                // Check for specific authentication error messages from Git
-                const stderr = result.stderr || result.error || ''; // Combine potential error sources
+                const stderr = result.stderr || result.error || '';
                 let userMessage = result.message || '同步到远程失败';
-                if (stderr.toLowerCase().includes('authentication failed') || 
-                    stderr.toLowerCase().includes('could not read username') || 
-                    stderr.toLowerCase().includes('permission denied') ||
-                    stderr.toLowerCase().includes('repository not found')) { // Repo not found can also be auth related
-                    userMessage = 'GitHub认证失败或仓库地址错误。请检查Token权限、仓库URL或重新设置Token。';
-                    console.error('Push failed due to potential auth/repo issue:', stderr);
-                    return res.status(401).json({ message: userMessage }); // Use 401 for auth errors
+
+                 // **关键修改：检测 Non-fast-forward 错误并返回特定错误**
+                if (stderr.toLowerCase().includes('non-fast-forward') || stderr.toLowerCase().includes('updates were rejected')) {
+                    userMessage = '推送失败：远程仓库包含本地没有的更新。请先 Pull 或选择强制推送。';
+                    console.warn('[data-sync] Manual Push failed due to non-fast-forward');
+                     // 返回 409 Conflict 状态码和特定错误类型
+                     return res.status(409).json({ error: 'non_fast_forward', message: userMessage });
                 }
-                // Return generic error for other issues
+                // 其他错误处理... (保持之前的认证错误等判断)
+                else if (stderr.toLowerCase().includes('authentication failed') || stderr.toLowerCase().includes('could not read username') || stderr.toLowerCase().includes('permission denied') || stderr.toLowerCase().includes('repository not found')) {
+                     userMessage = 'GitHub认证失败或仓库地址错误。请检查Token权限、仓库URL或重新设置Token。';
+                     console.error('Push failed due to potential auth/repo issue:', stderr);
+                     return res.status(401).json({ message: userMessage });
+                }
+                // 返回通用错误
                 res.status(400).json({ message: userMessage, details: result.details || stderr });
             }
         } catch (error) {
-            console.error('同步到远程错误:', error);
+            console.error('同步到远程错误 (手动):', error);
             res.status(500).json({ message: '同步到远程时发生内部错误: ' + error.message });
         }
     });
@@ -616,37 +653,36 @@ async function init(router) {
     // API端点 - 从远程同步（下载） - 路径修正
     router.post('/git/sync/pull', async (req, res) => {
         try {
-            console.log('收到从远程同步请求');
-            const result = await syncFromRemote(); // syncFromRemote now internally calls runGitCommand
-            
+            console.log('收到从远程同步请求 (手动)');
+            const result = await syncFromRemote(); // syncFromRemote now uses pull
+
             if (result.success) {
                 const config = await readConfig();
                 config.last_sync = new Date().toISOString();
                 await saveConfig(config);
                  res.json({ success: true, message: '从远程同步成功' });
             } else {
-                // Check for specific authentication/repo error messages from Git
                 const stderr = result.stderr || result.error || '';
                 let userMessage = result.message || '从远程同步失败';
-                 if (stderr.toLowerCase().includes('authentication failed') || 
-                     stderr.toLowerCase().includes('could not read username') || 
-                     stderr.toLowerCase().includes('permission denied') ||
-                     stderr.toLowerCase().includes('repository not found')) { 
+
+                 // **关键修改：检测合并冲突并返回特定错误**
+                 if (stderr.toLowerCase().includes('merge conflict') || stderr.toLowerCase().includes('automatic merge failed')) {
+                     userMessage = '合并冲突！请选择解决方案或手动处理。';
+                      console.warn('[data-sync] Manual Pull resulted in merge conflict');
+                      // 返回 409 Conflict 状态码和特定错误类型
+                      return res.status(409).json({ error: 'merge_conflict', message: userMessage });
+                 }
+                 // 其他错误处理... (保持之前的认证错误等判断)
+                 else if (stderr.toLowerCase().includes('authentication failed') || stderr.toLowerCase().includes('could not read username') || stderr.toLowerCase().includes('permission denied') || stderr.toLowerCase().includes('repository not found')) {
                      userMessage = 'GitHub认证失败或仓库地址错误。请检查Token权限、仓库URL或重新设置Token。';
                      console.error('Pull failed due to potential auth/repo issue:', stderr);
-                     return res.status(401).json({ message: userMessage }); // Use 401
+                     return res.status(401).json({ message: userMessage });
                  }
-                 // Handle merge conflicts specifically
-                 if (stderr.toLowerCase().includes('merge conflict')) {
-                     userMessage = '从远程同步失败：存在合并冲突，请手动解决。';
-                      console.warn('Pull resulted in merge conflict');
-                      return res.status(409).json({ message: userMessage }); // Use 409 Conflict
-                 }
-                 // Return generic error for other issues
+                 // 返回通用错误
                 res.status(400).json({ message: userMessage, details: result.details || stderr });
             }
         } catch (error) {
-            console.error('从远程同步错误:', error);
+            console.error('从远程同步错误 (手动):', error);
             res.status(500).json({ message: '从远程同步时发生内部错误: ' + error.message });
         }
     });

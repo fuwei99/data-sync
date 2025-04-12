@@ -673,4 +673,250 @@ function showToast(title, message, type) {
              }, 5500); // Slightly longer than delay
          }
     }
+}
+
+// 显示确认对话框
+function showConfirmDialog(options) {
+    return new Promise((resolve, reject) => {
+        const dialogElement = document.getElementById('confirmDialog');
+        if (!(dialogElement instanceof HTMLElement)) {
+            console.error('确认对话框元素未找到');
+            // 回退到原生 confirm
+            if (window.confirm(options.message)) {
+                resolve(true);
+            } else {
+                resolve(false);
+            }
+            return;
+        }
+
+        // 设置对话框内容
+        const titleElement = document.getElementById('confirmDialogLabel');
+        const messageElement = document.getElementById('confirm-dialog-message');
+        const confirmButton = document.getElementById('confirm-dialog-confirm-btn');
+        const cancelButton = document.getElementById('confirm-dialog-cancel-btn');
+        const iconElement = document.getElementById('confirm-dialog-icon');
+
+        // 防止元素不存在导致错误
+        if (titleElement instanceof HTMLElement) {
+            titleElement.textContent = options.title || '确认操作';
+        }
+        if (messageElement instanceof HTMLElement) {
+            messageElement.textContent = options.message || '';
+        }
+        if (confirmButton instanceof HTMLElement) {
+            confirmButton.textContent = options.confirmText || '确认';
+            confirmButton.className = 'btn ' + (options.confirmButtonClass || 'btn-primary');
+        }
+        if (cancelButton instanceof HTMLElement) {
+            cancelButton.textContent = options.cancelText || '取消';
+            cancelButton.className = 'btn ' + (options.cancelButtonClass || 'btn-secondary');
+        }
+        if (iconElement instanceof HTMLElement) {
+            let iconClass = 'bi bi-question-circle-fill text-primary';
+            if (options.type === 'warning') {
+                iconClass = 'bi bi-exclamation-triangle-fill text-warning';
+            } else if (options.type === 'danger') {
+                iconClass = 'bi bi-exclamation-circle-fill text-danger';
+            } else if (options.type === 'info') {
+                iconClass = 'bi bi-info-circle-fill text-info';
+            } else if (options.type === 'success') {
+                iconClass = 'bi bi-check-circle-fill text-success';
+            }
+            iconElement.innerHTML = `<i class="${iconClass}" style="font-size: 2.5rem;"></i>`;
+        }
+
+        // 创建并显示模态框
+        let dialog = null;
+        if (typeof window.bootstrap !== 'undefined' && typeof window.bootstrap.Modal === 'function') {
+            dialog = new window.bootstrap.Modal(dialogElement);
+            dialog.show();
+        } else {
+            console.error('Bootstrap Modal 组件未找到');
+            // 回退到原生 confirm
+            if (window.confirm(options.message)) {
+                resolve(true);
+            } else {
+                resolve(false);
+            }
+            return;
+        }
+
+        // 处理按钮点击事件
+        const confirmHandler = () => {
+            dialog.hide();
+            cleanupEventListeners();
+            resolve(true);
+        };
+
+        const cancelHandler = () => {
+            dialog.hide();
+            cleanupEventListeners();
+            resolve(false);
+        };
+
+        // 处理模态框隐藏事件
+        const hiddenHandler = () => {
+            cleanupEventListeners();
+            resolve(false);
+        };
+
+        // 清理事件监听器
+        const cleanupEventListeners = () => {
+            if (confirmButton instanceof HTMLElement) {
+                confirmButton.removeEventListener('click', confirmHandler);
+            }
+            if (cancelButton instanceof HTMLElement) {
+                cancelButton.removeEventListener('click', cancelHandler);
+            }
+            dialogElement.removeEventListener('hidden.bs.modal', hiddenHandler);
+        };
+
+        // 添加事件监听器
+        if (confirmButton instanceof HTMLElement) {
+            confirmButton.addEventListener('click', confirmHandler);
+        }
+        if (cancelButton instanceof HTMLElement) {
+            cancelButton.addEventListener('click', cancelHandler);
+        }
+        dialogElement.addEventListener('hidden.bs.modal', hiddenHandler);
+    });
+}
+
+// 处理同步按钮点击
+async function handleSync(action) {
+    const pluginId = 'data-sync'; // 或者从全局变量获取
+    const actionText = action === 'pull' ? '下载' : '上传';
+    const loadingText = `正在${actionText}...`;
+    
+    showLoading(loadingText);
+    updateStatus(loadingText);
+    disableButtons();
+
+    const endpoint = action === 'pull' ? '/git/sync/pull' : '/git/sync/push';
+    let forceEndpoint = null; // 用于后续强制操作
+    let responseStatus = 0;
+    let responseBody = {};
+
+    try {
+        const response = await fetch(`/api/plugins/${pluginId}${endpoint}`, { method: 'POST' });
+        responseStatus = response.status;
+        // 尝试解析所有响应体，即使是错误响应
+        try {
+            responseBody = await response.json();
+        } catch (parseError) {
+            // 如果响应体不是 JSON 或为空，则创建一个包含状态码的消息
+            responseBody = { message: `请求失败，HTTP 状态码: ${responseStatus}` };
+            console.warn('Failed to parse JSON response for status', responseStatus, await response.text());
+        }
+
+        if (response.ok) {
+            showToast(`${actionText}成功: ${responseBody.message || '操作完成'}`);
+            updateStatus('同步成功');
+            fetchConfig(); // 刷新配置（主要是最后同步时间）
+            fetchStatus(); // 刷新状态
+        } else {
+            // **处理特定错误 (409 Conflict)**
+            if (responseStatus === 409) {
+                if (responseBody.error === 'merge_conflict') {
+                    // --- Pull 冲突处理 ---
+                    updateStatus('合并冲突！请选择操作'); // 更新状态栏
+                    
+                    // 使用自定义确认对话框替代 window.confirm
+                    const overwriteLocal = await showConfirmDialog({
+                        title: '合并冲突',
+                        message: `${responseBody.message}\n\n是否用远程版本覆盖本地 (将丢失本地未推送更改)？`,
+                        confirmText: '覆盖本地',
+                        cancelText: '手动解决',
+                        type: 'warning',
+                        confirmButtonClass: 'btn-danger'
+                    });
+                    
+                    if (overwriteLocal) {
+                        forceEndpoint = '/git/sync/force-overwrite-local';
+                    } else {
+                        showToast('操作已取消。请手动解决冲突后再次尝试。您也可以尝试强制推送(如果确定本地为最新)。');
+                        updateStatus('合并冲突，请手动解决');
+                    }
+                } else if (responseBody.error === 'non_fast_forward') {
+                    // --- Push 非快进错误处理 ---
+                    updateStatus('推送失败，远程有更新'); // 更新状态栏
+                    
+                    // 使用自定义确认对话框替代 window.confirm
+                    const forcePush = await showConfirmDialog({
+                        title: '推送失败',
+                        message: `${responseBody.message}\n\n是否强制推送以覆盖远程更改 (危险操作)？`,
+                        confirmText: '强制推送',
+                        cancelText: '先执行 Pull',
+                        type: 'danger',
+                        confirmButtonClass: 'btn-danger'
+                    });
+                    
+                    if (forcePush) {
+                        forceEndpoint = '/git/sync/force-push';
+                    } else {
+                        showToast('操作已取消。请先 Pull 合并更改。');
+                        updateStatus('推送失败，需先 Pull');
+                    }
+                } else {
+                    // 其他 409 错误
+                     showToast(`${actionText}失败: ${responseBody.message || '未知冲突'}`, true);
+                     updateStatus(`${actionText}失败 (冲突)`);
+                }
+            } else {
+                 // 其他非 409 错误 (如 400, 401, 500)
+                 showToast(`${actionText}失败: ${responseBody.message || `HTTP ${responseStatus}`}`, true);
+                 updateStatus(`${actionText}失败`);
+            }
+        }
+
+        // 如果用户选择了强制操作
+        if (forceEndpoint) {
+            const forceActionText = forceEndpoint === '/git/sync/force-push' ? '强制推送' : '强制覆盖本地';
+            showLoading(`正在${forceActionText}...`);
+            updateStatus(`正在${forceActionText}...`);
+            // 按钮保持禁用状态
+
+            const forceResponse = await fetch(`/api/plugins/${pluginId}${forceEndpoint}`, { method: 'POST' });
+            let forceResponseBody = {};
+            try {
+                 forceResponseBody = await forceResponse.json();
+            } catch (parseError) {
+                 forceResponseBody = { message: `请求失败，HTTP 状态码: ${forceResponse.status}` };
+            }
+
+            if (forceResponse.ok) {
+                showToast(`操作成功: ${forceResponseBody.message || '完成'}`);
+                updateStatus('操作成功');
+                fetchConfig();
+                fetchStatus();
+            } else {
+                showToast(`操作失败: ${forceResponseBody.message || `HTTP ${forceResponse.status}`}`, true);
+                updateStatus('操作失败');
+                fetchStatus(); // 失败后也刷新状态，看看是否仍冲突
+            }
+        }
+
+    } catch (error) {
+        console.error('同步错误:', error);
+        showToast(`同步过程中发生错误: ${error.message}`, true);
+        updateStatus('同步错误');
+        // 发生网络等错误时，也尝试刷新状态
+        fetchStatus();
+    } finally {
+        // 只有在没有进行强制操作，或者强制操作完成后才隐藏loading和启用按钮
+        if (!forceEndpoint || (forceEndpoint && (responseStatus !== 409))) {
+             hideLoading();
+             enableButtons();
+             // 如果原始操作是 Pull 且遇到冲突但用户取消了，确保刷新状态
+             if (action === 'pull' && responseStatus === 409 && responseBody.error === 'merge_conflict' && !forceEndpoint) {
+                 fetchStatus();
+             }
+        }
+        // 如果执行了强制操作，loading 和按钮状态由强制操作的 finally 处理
+        else if (forceEndpoint) {
+            hideLoading();
+            enableButtons();
+        }
+    }
 } 
