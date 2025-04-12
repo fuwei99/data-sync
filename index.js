@@ -211,18 +211,37 @@ async function isGitInitialized() {
 
 // 初始化git仓库
 async function initGitRepo() {
-    // 检查是否已经初始化
-    if (await isGitInitialized()) {
-        return { success: true, message: 'Git repository already initialized' };
+    // 检查是否已经初始化 (this check will fail initially, which is okay)
+    const isInitializedResult = await runGitCommand('git rev-parse --is-inside-work-tree');
+    if (isInitializedResult.success && isInitializedResult.stdout.trim() === 'true') {
+        return { success: true, message: 'Git repository already initialized in data directory' };
+    }
+    console.log('[data-sync] Attempting to initialize Git repository in:', DATA_DIR); // Add detailed log
+
+    // 尝试初始化仓库，并显式捕获错误
+    let initResult;
+    try {
+        // Directly use execPromise to capture details on error
+        console.log(`[data-sync] Executing: git init in ${DATA_DIR}`);
+        const { stdout, stderr } = await execPromise('git init', { cwd: DATA_DIR });
+        console.log('[data-sync] git init stdout:', stdout);
+        console.log('[data-sync] git init stderr:', stderr); // Log success stderr (might contain warnings)
+         initResult = { success: true, stdout, stderr, message: 'Git repository initialized successfully' };
+    } catch (error) {
+        console.error(`[data-sync] Explicit git init failed in ${DATA_DIR}. Error: ${error.message}`); // Log error message
+        console.error('[data-sync] git init stdout on error:', error.stdout); // Log stdout from error object
+        console.error('[data-sync] git init stderr on error:', error.stderr); // Log stderr from error object
+        initResult = {
+             success: false,
+             message: 'Failed to initialize git repository',
+             error: error.message,
+             stdout: error.stdout || '',
+             stderr: error.stderr || ''
+         };
     }
 
-    // 初始化仓库
-    const initResult = await runGitCommand('git init');
-    if (!initResult.success) {
-        return { success: false, message: 'Failed to initialize git repository', details: initResult };
-    }
-
-    return { success: true, message: 'Git repository initialized successfully' };
+    // 返回结果
+    return initResult;
 }
 
 // 配置远程仓库
