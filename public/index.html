@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="csrf-token" content="">
+    <title>数据同步插件</title>
+    <!-- Bootstrap 5 CSS -->
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.2.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    <!-- Bootstrap Icons -->
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.10.0/font/bootstrap-icons.css" rel="stylesheet">
+    <!-- 自定义样式 -->
+    <style>
+        .card-header {
+            background-color: #f8f9fa;
+        }
+        .status-badge {
+            font-size: 85%;
+        }
+        #toast-container {
+            position: fixed;
+            top: 1rem;
+            right: 1rem;
+            z-index: 1050;
+        }
+        .fade-in {
+            animation: fadeIn 0.3s ease-in;
+        }
+        @keyframes fadeIn {
+            from { opacity: 0; }
+            to { opacity: 1; }
+        }
+    </style>
+</head>
+<body>
+    <div class="container py-4">
+        <h1 class="mb-4 d-flex align-items-center">
+            <i class="bi bi-cloud-arrow-up-down me-2"></i>
+            数据同步插件
+        </h1>
+        
+        <div class="alert alert-info mb-4">
+            <i class="bi bi-info-circle me-2"></i>
+            使用此插件可以将SillyTavern数据同步到Git仓库，实现多设备数据同步和备份功能。
+        </div>
+        
+        <!-- Toast容器 -->
+        <div id="toast-container"></div>
+        
+        <!-- 基本配置卡片 -->
+        <div class="card mb-4">
+            <div class="card-header">
+                <h5 class="card-title mb-0">
+                    <i class="bi bi-gear me-2"></i>
+                    基本配置
+                </h5>
+            </div>
+            <div class="card-body">
+                <form id="config_form">
+                    <div class="mb-3">
+                        <label for="repo_url" class="form-label">Git仓库URL</label>
+                        <input type="text" class="form-control" id="repo_url" placeholder="例如: https://github.com/username/repo.git">
+                        <div class="form-text">填写一个GitHub仓库的URL，用于同步数据</div>
+                    </div>
+                    
+                    <div class="mb-3">
+                        <label for="branch" class="form-label">分支名称</label>
+                        <input type="text" class="form-control" id="branch" placeholder="main" value="main">
+                        <div class="form-text">指定要使用的Git分支</div>
+                    </div>
+                    
+                    <div class="mb-3 form-check">
+                        <input type="checkbox" class="form-check-input" id="auto_sync">
+                        <label class="form-check-label" for="auto_sync">启用自动同步</label>
+                    </div>
+                    
+                    <div class="mb-3" id="sync_interval_container">
+                        <label for="sync_interval" class="form-label">同步间隔（分钟）</label>
+                        <input type="number" class="form-control" id="sync_interval" min="5" value="60">
+                        <div class="form-text">设置自动同步的时间间隔</div>
+                    </div>
+                    
+                    <button type="button" id="save_config_btn" class="btn btn-primary">
+                        <i class="bi bi-save me-1"></i>
+                        保存配置
+                    </button>
+                </form>
+            </div>
+        </div>
+        
+        <!-- 同步状态卡片 -->
+        <div class="card mb-4">
+            <div class="card-header">
+                <h5 class="card-title mb-0">
+                    <i class="bi bi-git me-2"></i>
+                    同步状态
+                </h5>
+            </div>
+            <div class="card-body">
+                <div class="row mb-3">
+                    <div class="col-md-4">
+                        <div class="card h-100">
+                            <div class="card-body">
+                                <h6 class="card-subtitle mb-2 text-muted">Git仓库状态</h6>
+                                <div id="git_status">
+                                    <div class="spinner-border spinner-border-sm text-primary" role="status">
+                                        <span class="visually-hidden">Loading...</span>
+                                    </div>
+                                    正在检查...
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="col-md-4">
+                        <div class="card h-100">
+                            <div class="card-body">
+                                <h6 class="card-subtitle mb-2 text-muted">GitHub令牌</h6>
+                                <p id="github_token_status">未设置</p>
+                                <button type="button" class="btn btn-sm btn-outline-primary" data-bs-toggle="modal" data-bs-target="#tokenModal">
+                                    <i class="bi bi-key me-1"></i>
+                                    设置令牌
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="col-md-4">
+                        <div class="card h-100">
+                            <div class="card-body">
+                                <h6 class="card-subtitle mb-2 text-muted">GitHub授权</h6>
+                                <p id="auth_status">未授权</p>
+                                <button type="button" id="authorize_btn" class="btn btn-sm btn-outline-success">
+                                    <i class="bi bi-github me-1"></i>
+                                    授权GitHub
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                
+                <div class="row mb-3">
+                    <div class="col">
+                        <h6>最后同步时间</h6>
+                        <p id="last_sync_time">从未同步</p>
+                    </div>
+                </div>
+                
+                <div class="d-flex gap-2">
+                    <button type="button" id="init_repo_btn" class="btn btn-secondary">
+                        <i class="bi bi-git me-1"></i>
+                        初始化仓库
+                    </button>
+                    <button type="button" id="sync_to_remote_btn" class="btn btn-success" disabled>
+                        <i class="bi bi-cloud-upload me-1"></i>
+                        同步到远程
+                    </button>
+                    <button type="button" id="sync_from_remote_btn" class="btn btn-info text-white" disabled>
+                        <i class="bi bi-cloud-download me-1"></i>
+                        从远程同步
+                    </button>
+                </div>
+            </div>
+        </div>
+        
+        <!-- GitHub令牌模态框 -->
+        <div class="modal fade" id="tokenModal" tabindex="-1" aria-labelledby="tokenModalLabel" aria-hidden="true">
+            <div class="modal-dialog">
+                <div class="modal-content">
+                    <div class="modal-header">
+                        <h5 class="modal-title" id="tokenModalLabel">设置GitHub令牌</h5>
+                        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="关闭"></button>
+                    </div>
+                    <div class="modal-body">
+                        <div class="alert alert-info">
+                            <i class="bi bi-info-circle me-2"></i>
+                            GitHub令牌用于访问私有仓库和提高API请求限制。您可以在GitHub的<a href="https://github.com/settings/tokens" target="_blank">开发者设置</a>中创建。
+                        </div>
+                        <div class="mb-3">
+                            <label for="github_token_input" class="form-label">GitHub令牌</label>
+                            <div class="input-group">
+                                <input type="password" class="form-control" id="github_token_input" placeholder="输入您的GitHub个人访问令牌">
+                                <button class="btn btn-outline-secondary" type="button" id="toggle_token_visibility">
+                                    <i class="bi bi-eye"></i>
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="modal-footer">
+                        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">取消</button>
+                        <button type="button" id="set_token_btn" class="btn btn-primary">保存令牌</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Bootstrap 5 JS和依赖 -->
+        <script src="https://cdn.jsdelivr.net/npm/@popperjs/core@2.11.6/dist/umd/popper.min.js"></script>
+        <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.2.3/dist/js/bootstrap.min.js"></script>
+        <!-- 自定义脚本 -->
+        <script src="/api/plugins/data-sync/ui/static/script.js"></script>
+    </div>
+</body>
+</html> 
