@@ -165,42 +165,87 @@ async function githubOAuth(code) {
 
 // 执行git命令
 async function runGitCommand(command, cwd = DATA_DIR) {
+    let config = {};
+    let originalRepoUrl = '';
+    let tokenUrl = '';
+    let temporarilySetUrl = false;
+
     try {
-        const config = await readConfig();
+        config = await readConfig();
         const token = config.github_token;
-        let effectiveCommand = command;
-        
-        // Modify command for auth only if token exists and it's a relevant command
-        if (token && (command.includes('git push') || command.includes('git pull') || command.includes('git clone'))) {
-            const repoUrl = config.repo_url;
-            if (repoUrl && repoUrl.startsWith('https://')) {
-                // Ensure no double injection if command was already modified
-                if (!repoUrl.includes('@github.com')) {
-                    const tokenUrl = repoUrl.replace('https://', `https://x-access-token:${token}@`);
-                    effectiveCommand = command.replace(repoUrl, tokenUrl);
-                    console.log(`Executing with token: ${effectiveCommand.substring(0, effectiveCommand.indexOf('git') + 10)}...`); // Log masked command
-                }
+        originalRepoUrl = config.repo_url;
+
+        // Special handling for push/pull/fetch with HTTPS token
+        if (token && originalRepoUrl && originalRepoUrl.startsWith('https://') && (command.startsWith('git push') || command.startsWith('git pull') || command.startsWith('git fetch'))) {
+            if (!originalRepoUrl.includes('@github.com')) { // Avoid double injection
+                tokenUrl = originalRepoUrl.replace('https://', `https://x-access-token:${token}@`);
+                
+                // --- BEGIN Authentication Change ---
+                console.log(`[data-sync] Temporarily setting remote origin URL with token for command: ${command}`);
+                const setUrlResult = await execPromise(`git remote set-url origin ${tokenUrl}`, { cwd });
+                console.log('[data-sync] set-url (with token) stdout:', setUrlResult.stdout);
+                console.log('[data-sync] set-url (with token) stderr:', setUrlResult.stderr); // Log potential warnings
+                temporarilySetUrl = true;
+                // No need to modify the command itself anymore
+                // --- END Authentication Change ---
             }
         }
-        
-        const { stdout, stderr } = await execPromise(effectiveCommand, { cwd });
-        // Check stderr for common non-fatal git messages if needed
-        if (stderr && !stderr.toLowerCase().includes('warning:') && !stderr.toLowerCase().includes('hint:')) {
-             // Consider logging non-fatal stderr for debugging
-             // console.warn(`Git command stderr: ${stderr}`);
+
+        // For clone, we still need to modify the command URL if applicable
+        if (token && originalRepoUrl && originalRepoUrl.startsWith('https://') && command.startsWith('git clone')) {
+             if (!originalRepoUrl.includes('@github.com')) {
+                 tokenUrl = originalRepoUrl.replace('https://', `https://x-access-token:${token}@`);
+                 // Replace the original URL in the clone command string
+                 command = command.replace(originalRepoUrl, tokenUrl);
+             }
         }
+
+        // Log the command that will be executed
+        console.log(`[data-sync] Attempting to execute command: ${command}`); // Command might be modified for clone
+
+        const { stdout, stderr } = await execPromise(command, { cwd });
+        
+        // If we temporarily set the URL, revert it now (after successful command)
+        if (temporarilySetUrl) {
+             console.log(`[data-sync] Reverting remote origin URL to original: ${originalRepoUrl}`);
+             await execPromise(`git remote set-url origin ${originalRepoUrl}`, { cwd });
+             temporarilySetUrl = false; // Mark as reverted
+         }
+
         return { success: true, stdout, stderr };
+
     } catch (error) {
-        // Log the actual error from execPromise
         console.error(`Git command failed: ${command}\nError: ${error.message}\nStdout: ${error.stdout}\nStderr: ${error.stderr}`);
-        // Return detailed error info
+        
+        // If we temporarily set the URL and the command failed, STILL try to revert it
+        if (temporarilySetUrl) {
+             try {
+                 console.warn(`[data-sync] Command failed, attempting to revert remote origin URL to original: ${originalRepoUrl}`);
+                 await execPromise(`git remote set-url origin ${originalRepoUrl}`, { cwd });
+                 temporarilySetUrl = false; // Mark as reverted
+             } catch (revertError) {
+                 console.error(`[data-sync] Failed to revert remote URL after command failure: ${revertError.message}`);
+                 // Log this error but proceed with returning the original error
+             }
+         }
+
         return { 
             success: false, 
-            error: error.message, // The exception message
-            stdout: error.stdout || '', // Ensure string
-            stderr: error.stderr || ''  // Ensure string
+            error: error.message,
+            stdout: error.stdout || '',
+            stderr: error.stderr || ''
         };
-    }
+    } finally {
+         // Final safety check: Ensure URL is reverted if something unexpected happened
+         if (temporarilySetUrl) {
+             try {
+                 console.warn(`[data-sync] Final check: Reverting remote origin URL in finally block: ${originalRepoUrl}`);
+                 await execPromise(`git remote set-url origin ${originalRepoUrl}`, { cwd });
+             } catch (finalRevertError) {
+                 console.error(`[data-sync] Failed to revert remote URL in finally block: ${finalRevertError.message}`);
+             }
+         }
+     }
 }
 
 // 检查git是否已初始化
@@ -304,19 +349,38 @@ async function syncToRemote() {
     return { success: true, message: 'Successfully synced to remote' };
 }
 
-// 从远程同步（下载）
+// 从远程同步（下载） - 使用 reset --hard 强制覆盖本地
 async function syncFromRemote() {
     // 获取当前分支名
     const branchResult = await runGitCommand('git branch --show-current');
     const branch = branchResult.success ? branchResult.stdout.trim() : 'main';
 
-    // 拉取最新的更改
-    const pullResult = await runGitCommand(`git pull origin ${branch}`);
-    if (!pullResult.success) {
-        return { success: false, message: 'Failed to pull from remote', details: pullResult };
+    console.log(`[data-sync] Fetching remote origin/${branch}`);
+    const fetchCommand = `git fetch origin ${branch}`;
+    const fetchResult = await runGitCommand(fetchCommand);
+    if (!fetchResult.success) {
+        // Fetch失败通常是连接/认证问题，之前的错误处理可能已包含这些
+        return { success: false, message: 'Failed to fetch from remote', details: fetchResult };
+    }
+    console.log(`[data-sync] Resetting local branch to origin/${branch} --hard`);
+    const resetCommand = `git reset --hard origin/${branch}`;
+    const resetResult = await runGitCommand(resetCommand);
+    if (!resetResult.success) {
+        return { success: false, message: 'Failed to reset local branch to remote state', details: resetResult };
     }
 
-    return { success: true, message: 'Successfully synced from remote' };
+    // 清理未跟踪的文件和目录 (可选但推荐，确保本地完全干净)
+    console.log(`[data-sync] Cleaning untracked files and directories (-fdx)`);
+    const cleanCommand = `git clean -fdx`; 
+    const cleanResult = await runGitCommand(cleanCommand);
+     if (!cleanResult.success) {
+         // Clean 失败通常不严重，但记录一下
+         console.warn(`[data-sync] Failed to clean untracked files after reset: ${cleanResult.stderr || cleanResult.error}`);
+         // 即使 clean 失败，reset 成功了也算成功
+         // return { success: false, message: 'Failed to clean untracked files after reset', details: cleanResult };
+     }
+
+    return { success: true, message: 'Successfully forced local state to match remote' };
 }
 
 // 获取git状态
