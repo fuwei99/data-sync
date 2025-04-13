@@ -195,6 +195,10 @@ function initUI() {
     } else {
         console.warn('令牌可见性切换按钮或输入框未找到');
     }
+    
+    // 每30秒检查一次撤销按钮状态
+    checkUndoAvailability();
+    setInterval(checkUndoAvailability, 30000);
 }
 
 // 绑定事件监听器
@@ -214,6 +218,9 @@ function bindEventListeners() {
     bindClick('sync_from_remote_btn', syncFromRemote);
     bindClick('authorize_btn', authorizeGitHub);
     bindClick('set_token_btn', setGitHubToken);
+    bindClick('undo_sync_btn', undoLastSync);
+    bindClick('force_push_btn', forcePush);
+    bindClick('force_pull_btn', forcePull);
     
     checkOAuthCallback();
 }
@@ -381,8 +388,22 @@ async function initRepo() {
 async function syncToRemote() {
     try {
         showSpinner('sync_to_remote_btn', true);
-        await apiRequest('/git/sync/push', 'POST');
-        showToast('成功', '成功同步到远程仓库', 'success');
+        
+        // 发起同步请求
+        const response = await apiRequest('/git/sync/push', 'POST');
+        
+        // 检查是否有警告
+        if (response && response.warning === 'local_state_not_restored') {
+            showToast('警告', '同步成功，但无法恢复本地状态。您的更改保存在stash中。请手动恢复。', 'warning');
+        } else {
+            showToast('成功', '成功同步到远程仓库', 'success');
+        }
+        
+        // 检查撤销可用性
+        if (response && response.undoAvailable) {
+            updateUndoButton('push', true);
+        }
+        
         await Promise.all([
             checkGitStatus(),
             loadConfig() 
@@ -390,18 +411,84 @@ async function syncToRemote() {
     } catch (error) {
         console.error('同步到远程失败:', error);
         const message = error instanceof Error ? error.message : String(error);
-        showToast('错误', `同步到远程失败: ${message}`, 'danger');
+        
+        // 特殊处理需要用户干预的错误 (检查状态码 409)
+        if (message.includes('(409)')) { // 修改判断条件，只检查状态码
+            // 检查是合并冲突还是非快进
+            if (message.includes('合并冲突') || message.toLowerCase().includes('merge conflict')) { // 保留对消息内容的检查以区分不同 409
+                 await handleMergeConflict();
+            } else if (message.includes('非快进') || message.toLowerCase().includes('non_fast_forward') || message.toLowerCase().includes('updates were rejected')) {
+                 await handleNonFastForward();
+            } else {
+                // 未知类型的 409 错误，也显示通用冲突处理
+                console.warn('Unknown 409 conflict type, showing generic merge conflict handler:', message);
+                await handleMergeConflict(); 
+            }
+        } 
+        else {
+            showToast('错误', `同步到远程失败: ${message}`, 'danger');
+        }
     } finally {
         showSpinner('sync_to_remote_btn', false);
     }
+}
+
+// 处理非快进错误
+async function handleNonFastForward() {
+    return new Promise((resolve) => {
+        showConfirmDialog({
+            title: '推送被拒绝',
+            message: `远程仓库包含您本地没有的更新。请选择操作：`,
+            confirmText: '强制推送',
+            cancelText: '取消',
+            type: 'warning',
+            confirmButtonClass: 'btn-danger'
+        }).then(async (result) => {
+            if (result) {
+                // 用户选择强制推送
+                try {
+                    showSpinner('sync_to_remote_btn', true);
+                    showToast('信息', '正在强制推送...', 'info');
+                    
+                    const result = await apiRequest('/git/sync/force-overwrite-remote', 'POST');
+                    showToast('成功', '强制推送成功', 'success');
+                    
+                    await Promise.all([
+                        checkGitStatus(),
+                        loadConfig()
+                    ]);
+                } catch (error) {
+                    console.error('强制推送失败:', error);
+                    const errMsg = error instanceof Error ? error.message : String(error);
+                    showToast('错误', `强制推送失败: ${errMsg}`, 'danger');
+                } finally {
+                    showSpinner('sync_to_remote_btn', false);
+                    resolve('force-push');
+                }
+            } else {
+                // 用户取消
+                showToast('信息', '推送已取消，建议先进行同步拉取', 'info');
+                resolve('cancel');
+            }
+        });
+    });
 }
 
 // 从远程同步
 async function syncFromRemote() {
     try {
         showSpinner('sync_from_remote_btn', true);
-        await apiRequest('/git/sync/pull', 'POST');
+        
+        // 发起同步请求（现在默认使用合并策略）
+        const response = await apiRequest('/git/sync/pull', 'POST');
+        
         showToast('成功', '成功从远程仓库同步', 'success');
+        
+        // 检查撤销可用性
+        if (response && response.undoAvailable) {
+            updateUndoButton('pull', true);
+        }
+        
         await Promise.all([
             checkGitStatus(),
             loadConfig() 
@@ -409,14 +496,192 @@ async function syncFromRemote() {
     } catch (error) {
         console.error('从远程同步失败:', error);
         const message = error instanceof Error ? error.message : String(error);
-        if (message.includes('Merge conflict')) {
-             showToast('错误', '从远程同步失败: 存在合并冲突，请手动解决', 'danger');
+        
+        // 特殊处理需要用户干预的错误 (检查状态码 409)
+        if (message.includes('(409)')) { // 修改判断条件，只检查状态码
+            // 假定 pull 操作的 409 都是合并冲突
+            await handleMergeConflict();
         } else {
-             showToast('错误', `从远程同步失败: ${message}`, 'danger');
+            showToast('错误', `从远程同步失败: ${message}`, 'danger');
         }
     } finally {
         showSpinner('sync_from_remote_btn', false);
     }
+}
+
+// 处理合并冲突
+async function handleMergeConflict() {
+    const dialogElement = document.getElementById('confirmDialog');
+    if (!(dialogElement instanceof HTMLElement)) {
+        console.error('确认对话框元素未找到');
+        showToast('错误', '无法显示冲突解决对话框，请刷新页面重试', 'danger');
+        return;
+    }
+
+    // 设置对话框内容
+    const titleElement = document.getElementById('confirmDialogLabel');
+    const messageElement = document.getElementById('confirm-dialog-message');
+    const confirmButton = document.getElementById('confirm-dialog-confirm-btn');
+    const cancelButton = document.getElementById('confirm-dialog-cancel-btn');
+    const iconElement = document.getElementById('confirm-dialog-icon');
+    const modalFooter = confirmButton?.parentElement;
+
+    // 创建"以本地覆盖远程"按钮
+    const overwriteRemoteButton = document.createElement('button');
+    overwriteRemoteButton.type = 'button';
+    overwriteRemoteButton.className = 'btn btn-warning';
+    overwriteRemoteButton.textContent = '以本地覆盖远程';
+    overwriteRemoteButton.id = 'overwrite-remote-btn';
+
+    if (titleElement instanceof HTMLElement) {
+        titleElement.textContent = '合并冲突';
+    }
+    if (messageElement instanceof HTMLElement) {
+        messageElement.innerHTML = `
+            <p>同步过程中发生<strong>合并冲突</strong>！</p>
+            <p>请选择如何解决此冲突：</p>
+            <ul>
+                <li><strong>以远程覆盖本地</strong>：放弃本地更改，完全采用远程版本</li>
+                <li><strong>以本地覆盖远程</strong>：保留本地更改，强制推送到远程</li>
+                <li><strong>取消同步</strong>：保持当前状态，稍后手动解决</li>
+            </ul>
+        `;
+    }
+    if (confirmButton instanceof HTMLElement) {
+        confirmButton.textContent = '以远程覆盖本地';
+        confirmButton.className = 'btn btn-danger';
+    }
+    if (cancelButton instanceof HTMLElement) {
+        cancelButton.textContent = '取消同步';
+        cancelButton.className = 'btn btn-secondary';
+    }
+    if (iconElement instanceof HTMLElement) {
+        iconElement.innerHTML = '<i class="bi bi-exclamation-triangle-fill text-warning" style="font-size: 2.5rem;"></i>';
+    }
+    
+    // 添加"以本地覆盖远程"按钮到对话框
+    if (modalFooter instanceof HTMLElement && confirmButton && cancelButton) {
+        // 移除之前可能存在的按钮
+        const existingButton = document.getElementById('overwrite-remote-btn');
+        if (existingButton) {
+            existingButton.remove();
+        }
+        
+        // 在确认和取消按钮之间插入新按钮
+        modalFooter.insertBefore(overwriteRemoteButton, cancelButton);
+    }
+
+    // 显示对话框
+    let dialog = null;
+    if (typeof window.bootstrap !== 'undefined' && typeof window.bootstrap.Modal === 'function') {
+        try {
+            console.log('[handleMergeConflict] Attempting to initialize Bootstrap modal for #confirmDialog');
+            dialog = new window.bootstrap.Modal(dialogElement);
+            console.log('[handleMergeConflict] Modal initialized, attempting to show...');
+            dialog.show();
+            console.log('[handleMergeConflict] Modal show() called.');
+        } catch (modalError) {
+             console.error('[handleMergeConflict] Error initializing or showing Bootstrap modal:', modalError);
+             showToast('错误', '无法初始化或显示冲突对话框', 'danger');
+             // 如果模态框显示失败，直接返回，避免后续逻辑出错
+             // 可以考虑 resolve('error') 或 reject()，但这里简单返回
+             return;
+        }
+    } else {
+        console.error('Bootstrap Modal 组件未找到');
+        showToast('错误', '无法显示冲突解决对话框', 'danger');
+        return; // Bootstrap 未加载，直接返回
+    }
+
+    // 等待用户选择
+    return new Promise((resolve) => {
+        const handleOverwriteLocal = async () => {
+            dialog.hide();
+            cleanupEventListeners();
+            
+            try {
+                showSpinner('sync_from_remote_btn', true);
+                showToast('信息', '正在以远程覆盖本地...', 'info');
+                
+                const result = await apiRequest('/git/sync/force-overwrite-local', 'POST');
+                showToast('成功', '已成功用远程内容覆盖本地', 'success');
+                
+                await Promise.all([
+                    checkGitStatus(),
+                    loadConfig()
+                ]);
+            } catch (error) {
+                console.error('强制覆盖本地失败:', error);
+                const errMsg = error instanceof Error ? error.message : String(error);
+                showToast('错误', `强制覆盖本地失败: ${errMsg}`, 'danger');
+            } finally {
+                showSpinner('sync_from_remote_btn', false);
+                resolve('overwrite-local');
+            }
+        };
+
+        const handleOverwriteRemote = async () => {
+            dialog.hide();
+            cleanupEventListeners();
+            
+            try {
+                showSpinner('sync_from_remote_btn', true);
+                showToast('信息', '正在以本地覆盖远程...', 'info');
+                
+                const result = await apiRequest('/git/sync/force-overwrite-remote', 'POST');
+                showToast('成功', '已成功用本地内容覆盖远程', 'success');
+                
+                await Promise.all([
+                    checkGitStatus(),
+                    loadConfig()
+                ]);
+            } catch (error) {
+                console.error('强制覆盖远程失败:', error);
+                const errMsg = error instanceof Error ? error.message : String(error);
+                showToast('错误', `强制覆盖远程失败: ${errMsg}`, 'danger');
+            } finally {
+                showSpinner('sync_from_remote_btn', false);
+                resolve('overwrite-remote');
+            }
+        };
+
+        const handleCancel = () => {
+            dialog.hide();
+            cleanupEventListeners();
+            showToast('信息', '同步已取消', 'info');
+            resolve('cancel');
+        };
+
+        // 处理模态框隐藏事件
+        const hiddenHandler = () => {
+            cleanupEventListeners();
+            resolve('cancel');
+        };
+
+        // 清理事件监听器
+        const cleanupEventListeners = () => {
+            if (confirmButton instanceof HTMLElement) {
+                confirmButton.removeEventListener('click', handleOverwriteLocal);
+            }
+            if (overwriteRemoteButton instanceof HTMLElement) {
+                overwriteRemoteButton.removeEventListener('click', handleOverwriteRemote);
+            }
+            if (cancelButton instanceof HTMLElement) {
+                cancelButton.removeEventListener('click', handleCancel);
+            }
+            dialogElement.removeEventListener('hidden.bs.modal', hiddenHandler);
+        };
+
+        // 添加事件监听器
+        if (confirmButton instanceof HTMLElement) {
+            confirmButton.addEventListener('click', handleOverwriteLocal);
+        }
+        overwriteRemoteButton.addEventListener('click', handleOverwriteRemote);
+        if (cancelButton instanceof HTMLElement) {
+            cancelButton.addEventListener('click', handleCancel);
+        }
+        dialogElement.addEventListener('hidden.bs.modal', hiddenHandler);
+    });
 }
 
 // 设置GitHub令牌
@@ -482,15 +747,26 @@ function updateButtonsState(isRepoInitialized) {
     const initRepoBtn = document.getElementById('init_repo_btn');
     const syncToRemoteBtn = document.getElementById('sync_to_remote_btn');
     const syncFromRemoteBtn = document.getElementById('sync_from_remote_btn');
-    
+    const forcePushBtn = document.getElementById('force_push_btn');
+    const forcePullBtn = document.getElementById('force_pull_btn');
+
+    // 始终启用初始化按钮
     if (initRepoBtn instanceof HTMLButtonElement) {
-        initRepoBtn.disabled = isRepoInitialized;
+        initRepoBtn.disabled = false; 
     }
+    // 其他按钮依赖于仓库初始化状态
+    const disableIfNotInit = !isRepoInitialized;
     if (syncToRemoteBtn instanceof HTMLButtonElement) {
-        syncToRemoteBtn.disabled = !isRepoInitialized;
+        syncToRemoteBtn.disabled = disableIfNotInit;
     }
     if (syncFromRemoteBtn instanceof HTMLButtonElement) {
-        syncFromRemoteBtn.disabled = !isRepoInitialized;
+        syncFromRemoteBtn.disabled = disableIfNotInit;
+    }
+    if (forcePushBtn instanceof HTMLButtonElement) {
+        forcePushBtn.disabled = disableIfNotInit;
+    }
+    if (forcePullBtn instanceof HTMLButtonElement) {
+        forcePullBtn.disabled = disableIfNotInit;
     }
 }
 
@@ -783,140 +1059,197 @@ function showConfirmDialog(options) {
     });
 }
 
-// 处理同步按钮点击
-async function handleSync(action) {
-    const pluginId = 'data-sync'; // 或者从全局变量获取
-    const actionText = action === 'pull' ? '下载' : '上传';
-    const loadingText = `正在${actionText}...`;
-    
-    showLoading(loadingText);
-    updateStatus(loadingText);
-    disableButtons();
-
-    const endpoint = action === 'pull' ? '/git/sync/pull' : '/git/sync/push';
-    let forceEndpoint = null; // 用于后续强制操作
-    let responseStatus = 0;
-    let responseBody = {};
-
+// 撤销上次同步操作
+async function undoLastSync() {
     try {
-        const response = await fetch(`/api/plugins/${pluginId}${endpoint}`, { method: 'POST' });
-        responseStatus = response.status;
-        // 尝试解析所有响应体，即使是错误响应
-        try {
-            responseBody = await response.json();
-        } catch (parseError) {
-            // 如果响应体不是 JSON 或为空，则创建一个包含状态码的消息
-            responseBody = { message: `请求失败，HTTP 状态码: ${responseStatus}` };
-            console.warn('Failed to parse JSON response for status', responseStatus, await response.text());
+        // 显示确认对话框
+        const confirmed = await showConfirmDialog({
+            title: '撤销同步',
+            message: '您确定要撤销上次同步操作吗？这将恢复到同步前的状态。',
+            confirmText: '确认撤销',
+            cancelText: '取消',
+            type: 'warning',
+            confirmButtonClass: 'btn-danger'
+        });
+        
+        if (!confirmed) {
+            return;
         }
-
-        if (response.ok) {
-            showToast(`${actionText}成功: ${responseBody.message || '操作完成'}`);
-            updateStatus('同步成功');
-            fetchConfig(); // 刷新配置（主要是最后同步时间）
-            fetchStatus(); // 刷新状态
+        
+        // 显示加载状态
+        showSpinner('undo_sync_btn', true);
+        const undoContainer = document.getElementById('undo_sync_container');
+        if (undoContainer) {
+            undoContainer.querySelector('small').textContent = '正在撤销...';
+        }
+        
+        // 执行撤销
+        const result = await apiRequest('/undo-sync', 'POST');
+        
+        if (result && result.success) {
+            const operationText = result.operation === 'push' ? '推送' : '拉取';
+            showToast('成功', `成功撤销了上次${operationText}操作`, 'success');
+            
+            // 更新状态
+            updateUndoButton(null, false);
+            await checkGitStatus();
         } else {
-            // **处理特定错误 (409 Conflict)**
-            if (responseStatus === 409) {
-                if (responseBody.error === 'merge_conflict') {
-                    // --- Pull 冲突处理 ---
-                    updateStatus('合并冲突！请选择操作'); // 更新状态栏
-                    
-                    // 使用自定义确认对话框替代 window.confirm
-                    const overwriteLocal = await showConfirmDialog({
-                        title: '合并冲突',
-                        message: `${responseBody.message}\n\n是否用远程版本覆盖本地 (将丢失本地未推送更改)？`,
-                        confirmText: '覆盖本地',
-                        cancelText: '手动解决',
-                        type: 'warning',
-                        confirmButtonClass: 'btn-danger'
-                    });
-                    
-                    if (overwriteLocal) {
-                        forceEndpoint = '/git/sync/force-overwrite-local';
-                    } else {
-                        showToast('操作已取消。请手动解决冲突后再次尝试。您也可以尝试强制推送(如果确定本地为最新)。');
-                        updateStatus('合并冲突，请手动解决');
-                    }
-                } else if (responseBody.error === 'non_fast_forward') {
-                    // --- Push 非快进错误处理 ---
-                    updateStatus('推送失败，远程有更新'); // 更新状态栏
-                    
-                    // 使用自定义确认对话框替代 window.confirm
-                    const forcePush = await showConfirmDialog({
-                        title: '推送失败',
-                        message: `${responseBody.message}\n\n是否强制推送以覆盖远程更改 (危险操作)？`,
-                        confirmText: '强制推送',
-                        cancelText: '先执行 Pull',
-                        type: 'danger',
-                        confirmButtonClass: 'btn-danger'
-                    });
-                    
-                    if (forcePush) {
-                        forceEndpoint = '/git/sync/force-push';
-                    } else {
-                        showToast('操作已取消。请先 Pull 合并更改。');
-                        updateStatus('推送失败，需先 Pull');
-                    }
-                } else {
-                    // 其他 409 错误
-                     showToast(`${actionText}失败: ${responseBody.message || '未知冲突'}`, true);
-                     updateStatus(`${actionText}失败 (冲突)`);
-                }
+            // 处理 stash apply 失败的特殊情况
+            if (result && result.error === 'stash_apply_failed') {
+                 showToast('警告', '撤销成功，但恢复本地更改时可能发生冲突。请检查您的文件状态，或使用git stash list查看并手动恢复。', 'warning');
+                 updateUndoButton(null, false); // 撤销操作本身算完成
+                 await checkGitStatus();
             } else {
-                 // 其他非 409 错误 (如 400, 401, 500)
-                 showToast(`${actionText}失败: ${responseBody.message || `HTTP ${responseStatus}`}`, true);
-                 updateStatus(`${actionText}失败`);
+                showToast('错误', result.message || '撤销操作失败', 'danger');
+                // 撤销失败时，可能需要重新检查撤销可用性
+                await checkUndoAvailability();
             }
         }
+    } catch (error) {
+        console.error('撤销同步失败:', error);
+        const message = error instanceof Error ? error.message : String(error);
+        showToast('错误', `撤销同步失败: ${message}`, 'danger');
+        // 撤销失败时，可能需要重新检查撤销可用性
+        await checkUndoAvailability();
+    } finally {
+        showSpinner('undo_sync_btn', false);
+    }
+}
 
-        // 如果用户选择了强制操作
-        if (forceEndpoint) {
-            const forceActionText = forceEndpoint === '/git/sync/force-push' ? '强制推送' : '强制覆盖本地';
-            showLoading(`正在${forceActionText}...`);
-            updateStatus(`正在${forceActionText}...`);
-            // 按钮保持禁用状态
-
-            const forceResponse = await fetch(`/api/plugins/${pluginId}${forceEndpoint}`, { method: 'POST' });
-            let forceResponseBody = {};
-            try {
-                 forceResponseBody = await forceResponse.json();
-            } catch (parseError) {
-                 forceResponseBody = { message: `请求失败，HTTP 状态码: ${forceResponse.status}` };
-            }
-
-            if (forceResponse.ok) {
-                showToast(`操作成功: ${forceResponseBody.message || '完成'}`);
-                updateStatus('操作成功');
-                fetchConfig();
-                fetchStatus();
-            } else {
-                showToast(`操作失败: ${forceResponseBody.message || `HTTP ${forceResponse.status}`}`, true);
-                updateStatus('操作失败');
-                fetchStatus(); // 失败后也刷新状态，看看是否仍冲突
-            }
+// 检查是否有可撤销的操作
+async function checkUndoAvailability() {
+    try {
+        const result = await apiRequest('/undo-availability', 'GET');
+        
+        if (result && result.available) {
+            updateUndoButton(result.operation, true, result.timestamp);
+        } else {
+            updateUndoButton(null, false);
         }
+    } catch (error) {
+        console.error('检查撤销可用性失败:', error);
+        // 失败时不显示撤销按钮
+        updateUndoButton(null, false);
+    }
+}
+
+// 更新撤销按钮状态
+function updateUndoButton(operation, available, timestamp) {
+    const container = document.getElementById('undo_sync_container');
+    const infoText = document.getElementById('undo_sync_info');
+    
+    if (!container || !infoText) {
+        console.warn('撤销按钮容器或信息文本未找到');
+        return;
+    }
+    
+    if (!available) {
+        container.style.display = 'none';
+        return;
+    }
+    
+    container.style.display = 'block';
+    
+    let operationText = '';
+    if (operation === 'push') {
+        operationText = '推送到远程';
+    } else if (operation === 'pull') {
+        operationText = '从远程拉取';
+    } else if (operation === 'force-push') {
+        operationText = '强制推送';
+    } else if (operation === 'force-pull') {
+        operationText = '强制拉取';
+    } else {
+        operationText = '同步';
+    }
+    
+    let timeText = '';
+    if (timestamp) {
+        try {
+            const syncTime = new Date(timestamp);
+            timeText = syncTime.toLocaleString();
+        } catch (e) {
+            timeText = timestamp;
+        }
+    }
+    
+    infoText.textContent = `可撤销最近一次${operationText}操作${timeText ? ` (${timeText})` : ''}`;
+}
+
+// 新增：强制推送到远程
+async function forcePush() {
+    try {
+        const confirmed = await showConfirmDialog({
+            title: '确认强制推送',
+            message: '警告：此操作将强制用您的本地数据覆盖远程仓库！远程仓库中任何本地没有的更改都将丢失。此操作通常用于解决合并冲突，请谨慎使用。您确定要继续吗？',
+            confirmText: '确认强制推送',
+            cancelText: '取消',
+            type: 'danger',
+            confirmButtonClass: 'btn-danger'
+        });
+
+        if (!confirmed) {
+            showToast('信息', '强制推送已取消', 'info');
+            return;
+        }
+
+        showSpinner('force_push_btn', true);
+        const response = await apiRequest('/git/sync/force-overwrite-remote', 'POST');
+        showToast('成功', '强制推送成功，远程仓库已更新为本地状态', 'success');
+
+        if (response && response.undoAvailable) {
+            updateUndoButton('force-push', true); // Pass a distinct operation type
+        }
+
+        await Promise.all([
+            checkGitStatus(),
+            loadConfig()
+        ]);
 
     } catch (error) {
-        console.error('同步错误:', error);
-        showToast(`同步过程中发生错误: ${error.message}`, true);
-        updateStatus('同步错误');
-        // 发生网络等错误时，也尝试刷新状态
-        fetchStatus();
+        console.error('强制推送失败:', error);
+        const message = error instanceof Error ? error.message : String(error);
+        showToast('错误', `强制推送失败: ${message}`, 'danger');
     } finally {
-        // 只有在没有进行强制操作，或者强制操作完成后才隐藏loading和启用按钮
-        if (!forceEndpoint || (forceEndpoint && (responseStatus !== 409))) {
-             hideLoading();
-             enableButtons();
-             // 如果原始操作是 Pull 且遇到冲突但用户取消了，确保刷新状态
-             if (action === 'pull' && responseStatus === 409 && responseBody.error === 'merge_conflict' && !forceEndpoint) {
-                 fetchStatus();
-             }
+        showSpinner('force_push_btn', false);
+    }
+}
+
+// 新增：强制从远程拉取（覆盖本地）
+async function forcePull() {
+    try {
+        const confirmed = await showConfirmDialog({
+            title: '确认强制拉取',
+            message: '警告：此操作将强制用远程仓库的数据覆盖您的本地数据！所有本地未推送的更改和未追踪的文件都将丢失。此操作通常用于解决合并冲突或同步初始化，请谨慎使用。您确定要继续吗？',
+            confirmText: '确认强制拉取',
+            cancelText: '取消',
+            type: 'danger', // Use danger for potentially destructive action
+            confirmButtonClass: 'btn-danger'
+        });
+
+        if (!confirmed) {
+            showToast('信息', '强制拉取已取消', 'info');
+            return;
         }
-        // 如果执行了强制操作，loading 和按钮状态由强制操作的 finally 处理
-        else if (forceEndpoint) {
-            hideLoading();
-            enableButtons();
+
+        showSpinner('force_pull_btn', true);
+        const response = await apiRequest('/git/sync/force-overwrite-local', 'POST');
+        showToast('成功', '强制拉取成功，本地数据已更新为远程状态', 'success');
+
+         if (response && response.undoAvailable) {
+            updateUndoButton('force-pull', true); // Pass a distinct operation type
         }
+
+        await Promise.all([
+            checkGitStatus(),
+            loadConfig()
+        ]);
+
+    } catch (error) {
+        console.error('强制拉取失败:', error);
+        const message = error instanceof Error ? error.message : String(error);
+        showToast('错误', `强制拉取失败: ${message}`, 'danger');
+    } finally {
+        showSpinner('force_pull_btn', false);
     }
 } 

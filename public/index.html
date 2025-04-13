@@ -144,7 +144,20 @@
                     </div>
                 </div>
                 
-                <div class="d-flex gap-2">
+                <div class="row mb-3">
+                    <div class="col">
+                        <h6>同步状态</h6>
+                        <p id="sync_status">就绪</p>
+                        <div id="loading_indicator" class="alert alert-info" style="display: none;">
+                            <div class="spinner-border spinner-border-sm text-primary me-2" role="status">
+                                <span class="visually-hidden">加载中...</span>
+                            </div>
+                            <span>正在处理...</span>
+                        </div>
+                    </div>
+                </div>
+                
+                <div class="d-flex gap-2 mb-3">
                     <button type="button" id="init_repo_btn" class="btn btn-secondary">
                         <i class="bi bi-git me-1"></i>
                         初始化仓库
@@ -157,6 +170,25 @@
                         <i class="bi bi-cloud-download me-1"></i>
                         从远程同步
                     </button>
+                    <button type="button" id="force_push_btn" class="btn btn-warning" disabled>
+                        <i class="bi bi-cloud-upload me-1"></i>
+                        强制推送
+                    </button>
+                    <button type="button" id="force_pull_btn" class="btn btn-danger" disabled>
+                        <i class="bi bi-cloud-download me-1"></i>
+                        强制拉取
+                    </button>
+                </div>
+                
+                <!-- 撤销同步按钮 -->
+                <div id="undo_sync_container" style="display: none;" class="mb-3">
+                    <button type="button" id="undo_sync_btn" class="btn btn-outline-danger">
+                        <i class="bi bi-arrow-counterclockwise me-1"></i>
+                        撤销上次同步
+                    </button>
+                    <small id="undo_sync_info" class="text-muted ms-2">
+                        可撤销最近一次同步操作
+                    </small>
                 </div>
             </div>
         </div>

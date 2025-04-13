@@ -83,6 +83,10 @@ const DEFAULT_CONFIG = {
 // 定时任务引用，用于停止任务
 let syncInterval = null;
 
+// 保存快照供撤销使用
+let lastSyncSnapshot = null;
+let lastSyncOperation = null; // 'push' 或 'pull'
+
 // 读取配置
 async function readConfig() {
     try {
@@ -164,7 +168,7 @@ async function githubOAuth(code) {
 }
 
 // 执行git命令
-async function runGitCommand(command, cwd = DATA_DIR) {
+async function runGitCommand(command, options = {}) {
     let config = {};
     let originalRepoUrl = '';
     let tokenUrl = '';
@@ -182,7 +186,7 @@ async function runGitCommand(command, cwd = DATA_DIR) {
                 
                 // --- BEGIN Authentication Change ---
                 console.log(`[data-sync] Temporarily setting remote origin URL with token for command: ${command}`);
-                const setUrlResult = await execPromise(`git remote set-url origin ${tokenUrl}`, { cwd });
+                const setUrlResult = await execPromise(`git remote set-url origin ${tokenUrl}`, { cwd: DATA_DIR });
                 console.log('[data-sync] set-url (with token) stdout:', setUrlResult.stdout);
                 console.log('[data-sync] set-url (with token) stderr:', setUrlResult.stderr); // Log potential warnings
                 temporarilySetUrl = true;
@@ -203,25 +207,78 @@ async function runGitCommand(command, cwd = DATA_DIR) {
         // Log the command that will be executed
         console.log(`[data-sync] Attempting to execute command: ${command}`); // Command might be modified for clone
 
-        const { stdout, stderr } = await execPromise(command, { cwd });
+        // 处理options参数，确保cwd属性正确
+        const execOptions = { 
+            cwd: options.cwd || DATA_DIR 
+        };
         
-        // If we temporarily set the URL, revert it now (after successful command)
-        if (temporarilySetUrl) {
-             console.log(`[data-sync] Reverting remote origin URL to original: ${originalRepoUrl}`);
-             await execPromise(`git remote set-url origin ${originalRepoUrl}`, { cwd });
-             temporarilySetUrl = false; // Mark as reverted
-         }
+        // 处理标准输入
+        if (options && options.input !== undefined) {
+            const result = await new Promise((resolve, reject) => {
+                const childProcess = require('child_process').spawn(
+                    command.split(' ')[0], // git
+                    command.split(' ').slice(1), // 命令参数
+                    { cwd: execOptions.cwd }
+                );
+                
+                let stdout = '';
+                let stderr = '';
+                
+                childProcess.stdout.on('data', (data) => {
+                    stdout += data.toString();
+                });
+                
+                childProcess.stderr.on('data', (data) => {
+                    stderr += data.toString();
+                });
+                
+                childProcess.on('close', (code) => {
+                    if (code === 0) {
+                        resolve({ success: true, stdout, stderr });
+                    } else {
+                        resolve({ success: false, stdout, stderr });
+                    }
+                });
+                
+                childProcess.on('error', (err) => {
+                    reject(err);
+                });
+                
+                // 写入标准输入
+                if (options.input) {
+                    childProcess.stdin.write(options.input);
+                    childProcess.stdin.end();
+                }
+            });
+            
+            return result;
+        } else {
+            // 常规命令执行
+            const { stdout, stderr } = await execPromise(command, execOptions);
+            
+            // If we temporarily set the URL, revert it now (after successful command)
+            if (temporarilySetUrl) {
+                 console.log(`[data-sync] Reverting remote origin URL to original: ${originalRepoUrl}`);
+                 await execPromise(`git remote set-url origin ${originalRepoUrl}`, { cwd: DATA_DIR });
+                 temporarilySetUrl = false; // Mark as reverted
+             }
 
-        return { success: true, stdout, stderr };
-
+            return { success: true, stdout, stderr };
+        }
     } catch (error) {
-        console.error(`Git command failed: ${command}\nError: ${error.message}\nStdout: ${error.stdout}\nStderr: ${error.stderr}`);
+        // 修改错误日志记录，避免打印大型二进制diff
+        let stdoutLog = error.stdout || '';
+        let stderrLog = error.stderr || '';
+        if (command.startsWith('git diff --binary')) {
+            stdoutLog = '[Binary diff output suppressed]';
+        }
+        console.error(`Git command failed: ${command}\nError: ${error.message}\nStdout: ${stdoutLog}\nStderr: ${stderrLog}`);
         
         // If we temporarily set the URL and the command failed, STILL try to revert it
         if (temporarilySetUrl) {
              try {
                  console.warn(`[data-sync] Command failed, attempting to revert remote origin URL to original: ${originalRepoUrl}`);
-                 await execPromise(`git remote set-url origin ${originalRepoUrl}`, { cwd });
+                 await execPromise(`git remote set-url origin ${originalRepoUrl}`, { cwd: DATA_DIR });
                  temporarilySetUrl = false; // Mark as reverted
              } catch (revertError) {
                  console.error(`[data-sync] Failed to revert remote URL after command failure: ${revertError.message}`);
@@ -240,7 +297,7 @@ async function runGitCommand(command, cwd = DATA_DIR) {
          if (temporarilySetUrl) {
              try {
                  console.warn(`[data-sync] Final check: Reverting remote origin URL in finally block: ${originalRepoUrl}`);
-                 await execPromise(`git remote set-url origin ${originalRepoUrl}`, { cwd });
+                 await execPromise(`git remote set-url origin ${originalRepoUrl}`, { cwd: DATA_DIR });
              } catch (finalRevertError) {
                  console.error(`[data-sync] Failed to revert remote URL in finally block: ${finalRevertError.message}`);
              }
@@ -256,12 +313,26 @@ async function isGitInitialized() {
 
 // 初始化git仓库
 async function initGitRepo() {
-    // 检查是否已经初始化 (this check will fail initially, which is okay)
-    const isInitializedResult = await runGitCommand('git rev-parse --is-inside-work-tree');
-    if (isInitializedResult.success && isInitializedResult.stdout.trim() === 'true') {
-        return { success: true, message: 'Git repository already initialized in data directory' };
+    console.log('[data-sync] Attempting to initialize/re-initialize Git repository in:', DATA_DIR); // 更新日志消息
+
+    const gitDirPath = path.join(DATA_DIR, '.git');
+    try {
+        // 尝试删除现有的 .git 目录 (如果存在)
+        console.log(`[data-sync] Checking for existing .git directory at ${gitDirPath}`);
+        await fs.rm(gitDirPath, { recursive: true, force: true });
+        console.log('[data-sync] Successfully removed existing .git directory (or it did not exist).');
+    } catch (error) {
+        // 如果删除失败 (除了 'ENOENT' - 不存在)，记录警告但继续尝试 init
+        // force: true 应该能处理大多数情况，权限问题可能仍然导致失败
+        if (error.code !== 'ENOENT') {
+            console.warn(`[data-sync] Failed to remove existing .git directory: ${error.message}. Proceeding with init attempt anyway.`);
+            // 可以选择在这里返回错误，但用户希望强制初始化
+            // return { success: false, message: `Failed to remove existing .git directory: ${error.message}` };
+        } else {
+            console.log('[data-sync] No existing .git directory found. Proceeding with init.');
+        }
     }
-    console.log('[data-sync] Attempting to initialize Git repository in:', DATA_DIR); // Add detailed log
+
 
     // 尝试初始化仓库，并显式捕获错误
     let initResult;
@@ -271,7 +342,7 @@ async function initGitRepo() {
         const { stdout, stderr } = await execPromise('git init', { cwd: DATA_DIR });
         console.log('[data-sync] git init stdout:', stdout);
         console.log('[data-sync] git init stderr:', stderr); // Log success stderr (might contain warnings)
-         initResult = { success: true, stdout, stderr, message: 'Git repository initialized successfully' };
+         initResult = { success: true, stdout, stderr, message: 'Git repository initialized/re-initialized successfully' }; // 更新消息
     } catch (error) {
         console.error(`[data-sync] Explicit git init failed in ${DATA_DIR}. Error: ${error.message}`); // Log error message
         console.error('[data-sync] git init stdout on error:', error.stdout); // Log stdout from error object
@@ -311,42 +382,128 @@ async function configureRemote(repoUrl) {
     return { success: true, message: 'Remote repository configured successfully' };
 }
 
-// 执行同步（上传）
-async function syncToRemote() {
-    // 获取状态
-    const statusResult = await runGitCommand('git status --porcelain');
-    if (!statusResult.success) {
-        return { success: false, message: 'Failed to get git status', details: statusResult };
+// 使用先合并后推送的策略（不影响本地）
+async function syncToRemotePreservingLocal() {
+    // 1. 保存本地工作状态
+    console.log('[data-sync] Stashing local changes to preserve state');
+    const stashResult = await runGitCommand('git stash push -u -m "Automatic stash before sync"');
+    const hasStashed = !stashResult.stdout.includes('No local changes to save');
+    
+    try {
+        // 2. 获取当前分支
+        const branchResult = await runGitCommand('git branch --show-current');
+        const branch = branchResult.success ? branchResult.stdout.trim() : 'main';
+        
+        // 3. 获取远程状态
+        const fetchResult = await runGitCommand(`git fetch origin ${branch}`);
+        if (!fetchResult.success) {
+            return { success: false, message: 'Failed to fetch from remote', details: fetchResult };
+        }
+        
+        // 4. 检查本地与远程是否有差异
+        const diffResult = await runGitCommand(`git diff HEAD origin/${branch}`);
+        const hasDiff = diffResult.success && diffResult.stdout.trim() !== '';
+        
+        // 5. 临时合并远程并推送
+        if (hasDiff) {
+            // 创建临时合并提交
+            const mergeResult = await runGitCommand(`git merge origin/${branch} --no-ff -m "Temporary merge for sync"`);
+            if (!mergeResult.success) {
+                // 只要 merge 失败，就返回 merge_conflict 信号
+                console.warn(`[data-sync] Merge failed during push operation (temporary merge step): ${mergeResult.stderr || mergeResult.error}`);
+                // 尝试中止合并，即使失败也要继续返回错误
+                try {
+                    await runGitCommand('git merge --abort');
+                } catch (abortError) {
+                    console.error('[data-sync] Failed to abort merge after push merge attempt failed:', abortError);
+                }
+                
+                // 恢复本地状态 (如果之前有 stash)
+                if (hasStashed) {
+                    try {
+                        await runGitCommand('git stash pop');
+                    } catch (popError) {
+                         console.error('[data-sync] Failed to pop stash after push merge attempt failed:', popError);
+                    }
+                }
+                
+                return { 
+                    success: false, 
+                    message: 'Merge failed during push. Please resolve.', // 使用通用消息
+                    error: 'merge_conflict',
+                    details: mergeResult 
+                };
+            }
+        }
+        
+        // 6. 添加本地修改并提交
+        const addResult = await runGitCommand('git add .');
+        if (!addResult.success) {
+            return { success: false, message: 'Failed to add files', details: addResult };
+        }
+        
+        // 检查是否有变更需要提交
+        const statusResult = await runGitCommand('git status --porcelain');
+        if (statusResult.success && statusResult.stdout.trim() !== '') {
+            // 有变更需要提交
+            const commitResult = await runGitCommand('git commit -m "Sync data from SillyTavern"');
+            if (!commitResult.success) {
+                return { success: false, message: 'Failed to commit changes', details: commitResult };
+            }
+        }
+        
+        // 7. 推送到远程
+        const pushResult = await runGitCommand(`git push origin ${branch}`);
+        if (!pushResult.success) {
+            // 检查是否是非快进错误
+            const stderr = pushResult.stderr || '';
+            if (stderr.includes('non-fast-forward') || 
+                stderr.includes('fetch first') || 
+                stderr.includes('rejected') || 
+                stderr.includes('updates were rejected')) {
+                
+                return { 
+                    success: false, 
+                    message: 'Push rejected: Remote contains changes that need to be merged first', 
+                    error: 'non_fast_forward',
+                    details: pushResult
+                };
+            }
+            
+            return { success: false, message: 'Failed to push to remote', details: pushResult };
+        }
+        
+        return { success: true, message: 'Successfully synced to remote' };
+    } catch (error) {
+        console.error('[data-sync] Error during preserved local sync:', error);
+        return { success: false, message: `Sync error: ${error.message}`, error: 'general_error' };
+    } finally {
+        try {
+            // 8. 恢复初始状态
+            if (hasStashed) {
+                // 重置任何临时合并
+                const resetResult = await runGitCommand('git reset --hard HEAD@{1}');
+                
+                // 恢复原始工作状态
+                const popResult = await runGitCommand('git stash pop');
+                if (!popResult.success) {
+                    console.error('[data-sync] Failed to restore local changes:', popResult.stderr);
+                    return { 
+                        success: true, 
+                        message: 'Synced to remote, but failed to restore local state. Your changes are in the stash.', 
+                        warning: 'local_state_not_restored'
+                    };
+                }
+            }
+        } catch (restoreError) {
+            console.error('[data-sync] Error restoring local state:', restoreError);
+            return { 
+                success: true, 
+                message: 'Synced to remote, but failed to restore local state. Your changes are in the stash.', 
+                warning: 'local_state_not_restored'
+            };
+        }
     }
-
-    // 如果没有变更，不需要提交
-    if (!statusResult.stdout.trim()) {
-        return { success: true, message: 'No changes to commit' };
-    }
-
-    // 添加所有文件
-    const addResult = await runGitCommand('git add .');
-    if (!addResult.success) {
-        return { success: false, message: 'Failed to add files', details: addResult };
-    }
-
-    // 提交更改
-    const commitResult = await runGitCommand('git commit -m "Sync data from SillyTavern"');
-    if (!commitResult.success) {
-        return { success: false, message: 'Failed to commit changes', details: commitResult };
-    }
-
-    // 获取当前分支名
-    const branchResult = await runGitCommand('git branch --show-current');
-    const branch = branchResult.success ? branchResult.stdout.trim() : 'main';
-
-    // 推送到远程
-    const pushResult = await runGitCommand(`git push -u origin ${branch}`);
-    if (!pushResult.success) {
-        return { success: false, message: 'Failed to push to remote', details: pushResult };
-    }
-
-    return { success: true, message: 'Successfully synced to remote' };
 }
 
 // 从远程同步（下载） - 使用 reset --hard 强制覆盖本地
@@ -381,6 +538,53 @@ async function syncFromRemote() {
      }
 
     return { success: true, message: 'Successfully forced local state to match remote' };
+}
+
+// 从远程同步 - 使用合并(merge)策略
+async function syncFromRemoteWithMerge() {
+    // 获取当前分支名
+    const branchResult = await runGitCommand('git branch --show-current');
+    const branch = branchResult.success ? branchResult.stdout.trim() : 'main';
+
+    console.log(`[data-sync] Fetching remote origin/${branch}`);
+    const fetchCommand = `git fetch origin ${branch}`;
+    const fetchResult = await runGitCommand(fetchCommand);
+    if (!fetchResult.success) {
+        return { success: false, message: 'Failed to fetch from remote', details: fetchResult };
+    }
+    
+    console.log(`[data-sync] Merging origin/${branch} into local branch`);
+    const mergeCommand = `git merge origin/${branch}`;
+    const mergeResult = await runGitCommand(mergeCommand);
+    if (!mergeResult.success) {
+        // 只要 merge 失败，就返回 merge_conflict 信号
+        console.warn(`[data-sync] Merge failed during pull operation: ${mergeResult.stderr || mergeResult.error}`);
+        return { 
+            success: false, 
+            message: 'Merge failed during pull. Please resolve.', // 使用通用消息
+            error: 'merge_conflict',
+            details: mergeResult 
+        };
+    }
+
+    return { success: true, message: 'Successfully merged changes from remote' };
+}
+
+// 强制以本地覆盖远程 (用于解决合并冲突)
+async function forceOverwriteRemote() {
+    // 获取当前分支名
+    const branchResult = await runGitCommand('git branch --show-current');
+    const branch = branchResult.success ? branchResult.stdout.trim() : 'main';
+    
+    // 强制推送本地分支到远程
+    console.log(`[data-sync] Force pushing local branch to origin/${branch}`);
+    const pushCommand = `git push -f origin ${branch}`;
+    const pushResult = await runGitCommand(pushCommand);
+    if (!pushResult.success) {
+        return { success: false, message: 'Failed to force push to remote', details: pushResult };
+    }
+    
+    return { success: true, message: 'Successfully forced remote to match local' };
 }
 
 // 获取git状态
@@ -419,56 +623,45 @@ function startAutoSync(interval) {
     
     syncInterval = setInterval(async () => {
         console.log('[data-sync] Auto-sync triggered');
-        let pullSuccess = false;
         try {
-            // 1. 先尝试 Pull
-            console.log('[data-sync] Auto-sync: Attempting pull...');
-            const pullResult = await syncFromRemote(); // Uses pull internally now
-
-            if (pullResult.success) {
-                console.log('[data-sync] Auto-sync: Pull successful');
-                pullSuccess = true;
+            // 使用合并策略而非强制覆盖
+            const syncResult = await syncToRemotePreservingLocal();
+            
+            if (syncResult.success) {
+                console.log('[data-sync] Auto-sync: Sync successful');
+                // 更新最后同步时间
+                const config = await readConfig();
+                config.last_sync = new Date().toISOString();
+                await saveConfig(config);
             } else {
-                // 检查 Pull 失败是否因为合并冲突
-                const stderr = pullResult.stderr || pullResult.error || '';
-                if (stderr.toLowerCase().includes('merge conflict') || stderr.toLowerCase().includes('automatic merge failed')) {
-                    console.warn('[data-sync] Auto-sync: Pull failed due to merge conflict. Aborting merge attempt...');
+                // 处理错误
+                const stderr = syncResult.stderr || syncResult.error || '';
+                
+                // 检查合并冲突
+                if (syncResult.error === 'merge_conflict' || 
+                    stderr.toLowerCase().includes('merge conflict') || 
+                    stderr.toLowerCase().includes('automatic merge failed')) {
+                    console.warn('[data-sync] Auto-sync: Merge conflict detected. Aborting merge attempt...');
                     try {
                         const abortResult = await runGitCommand('git merge --abort');
                         if (abortResult.success) {
                             console.log('[data-sync] Auto-sync: Merge aborted successfully.');
                         } else {
                             console.error('[data-sync] Auto-sync: Failed to abort merge after conflict:', abortResult.stderr || abortResult.error);
-                            // If abort fails, maybe try reset? Or just log and skip push.
-                            // console.warn('[data-sync] Auto-sync: Attempting git reset --hard HEAD as fallback...');
-                            // await runGitCommand('git reset --hard HEAD'); 
                         }
                     } catch (abortError) {
                         console.error('[data-sync] Auto-sync: Error occurred while trying to abort merge:', abortError);
                     }
-                    // 即使 abort 失败，也跳过 push
-                    console.log('[data-sync] Auto-sync: Skipping push due to merge conflict during pull.');
-                } else {
-                    // 其他 Pull 失败原因 (网络, 认证等)
-                    console.error('[data-sync] Auto-sync: Pull failed (non-conflict):', pullResult.message, pullResult.details || stderr);
-                    console.log('[data-sync] Auto-sync: Skipping push due to non-conflict pull error.');
                 }
-                 // Pull 失败，不进行 Push
-                 pullSuccess = false;
-            }
-
-            // 2. 如果 Pull 成功，再尝试 Push
-            if (pullSuccess) {
-                console.log('[data-sync] Auto-sync: Attempting push...');
-                const pushResult = await syncToRemote();
-                if (pushResult.success) {
-                    console.log('[data-sync] Auto-sync: Push successful');
-                    // 更新最后同步时间
-                    const config = await readConfig();
-                    config.last_sync = new Date().toISOString();
-                    await saveConfig(config);
-                } else {
-                    console.error('[data-sync] Auto-sync: Push failed:', pushResult.message, pushResult.details || pushResult.stderr);
+                // 检查非快进错误
+                else if (syncResult.error === 'non_fast_forward' || 
+                         stderr.toLowerCase().includes('non-fast-forward') || 
+                         stderr.toLowerCase().includes('updates were rejected')) {
+                    console.warn('[data-sync] Auto-sync: Non-fast-forward error detected. Auto-sync cannot resolve this automatically.');
+                }
+                // 其他错误
+                else {
+                    console.error('[data-sync] Auto-sync: Sync failed:', syncResult.message, syncResult.details || stderr);
                 }
             }
         } catch (error) {
@@ -617,29 +810,48 @@ async function init(router) {
     router.post('/git/sync/push', async (req, res) => {
         try {
             console.log('收到同步到远程请求 (手动)');
-            const result = await syncToRemote(); // Uses add, commit, push
+            
+            // 创建快照用于撤销
+            await createSyncSnapshot('push');
+            
+            // 使用合并策略进行推送
+            const result = await syncToRemotePreservingLocal();
 
             if (result.success) {
                 const config = await readConfig();
                 config.last_sync = new Date().toISOString();
                 await saveConfig(config);
-                res.json({ success: true, message: '同步到远程成功' });
+                res.json({ success: true, message: '同步到远程成功', undoAvailable: true });
             } else {
                 const stderr = result.stderr || result.error || '';
                 let userMessage = result.message || '同步到远程失败';
 
-                 // **关键修改：检测 Non-fast-forward 错误并返回特定错误**
-                if (stderr.toLowerCase().includes('non-fast-forward') || stderr.toLowerCase().includes('updates were rejected')) {
+                // 检测合并冲突
+                if (result.error === 'merge_conflict' || 
+                    stderr.toLowerCase().includes('merge conflict') || 
+                    stderr.toLowerCase().includes('automatic merge failed')) {
+                    userMessage = '合并冲突！请选择解决方案。';
+                    console.warn('[data-sync] Manual Push resulted in merge conflict');
+                    // 返回 409 Conflict 状态码和特定错误类型
+                    return res.status(409).json({ error: 'merge_conflict', message: userMessage });
+                }
+                // 检测 Non-fast-forward 错误
+                else if (result.error === 'non_fast_forward' || 
+                         stderr.toLowerCase().includes('non-fast-forward') || 
+                         stderr.toLowerCase().includes('updates were rejected')) {
                     userMessage = '推送失败：远程仓库包含本地没有的更新。请先 Pull 或选择强制推送。';
                     console.warn('[data-sync] Manual Push failed due to non-fast-forward');
-                     // 返回 409 Conflict 状态码和特定错误类型
-                     return res.status(409).json({ error: 'non_fast_forward', message: userMessage });
+                    // 返回 409 Conflict 状态码和特定错误类型
+                    return res.status(409).json({ error: 'non_fast_forward', message: userMessage });
                 }
-                // 其他错误处理... (保持之前的认证错误等判断)
-                else if (stderr.toLowerCase().includes('authentication failed') || stderr.toLowerCase().includes('could not read username') || stderr.toLowerCase().includes('permission denied') || stderr.toLowerCase().includes('repository not found')) {
-                     userMessage = 'GitHub认证失败或仓库地址错误。请检查Token权限、仓库URL或重新设置Token。';
-                     console.error('Push failed due to potential auth/repo issue:', stderr);
-                     return res.status(401).json({ message: userMessage });
+                // 其他错误处理...
+                else if (stderr.toLowerCase().includes('authentication failed') || 
+                         stderr.toLowerCase().includes('could not read username') || 
+                         stderr.toLowerCase().includes('permission denied') || 
+                         stderr.toLowerCase().includes('repository not found')) {
+                    userMessage = 'GitHub认证失败或仓库地址错误。请检查Token权限、仓库URL或重新设置Token。';
+                    console.error('Push failed due to potential auth/repo issue:', stderr);
+                    return res.status(401).json({ message: userMessage });
                 }
                 // 返回通用错误
                 res.status(400).json({ message: userMessage, details: result.details || stderr });
@@ -654,36 +866,107 @@ async function init(router) {
     router.post('/git/sync/pull', async (req, res) => {
         try {
             console.log('收到从远程同步请求 (手动)');
-            const result = await syncFromRemote(); // syncFromRemote now uses pull
+            
+            // 创建快照用于撤销
+            await createSyncSnapshot('pull');
+            
+            // 使用合并策略而非强制覆盖
+            const result = await syncFromRemoteWithMerge();
 
             if (result.success) {
                 const config = await readConfig();
                 config.last_sync = new Date().toISOString();
                 await saveConfig(config);
-                 res.json({ success: true, message: '从远程同步成功' });
+                res.json({ success: true, message: '从远程同步成功', undoAvailable: true });
             } else {
                 const stderr = result.stderr || result.error || '';
                 let userMessage = result.message || '从远程同步失败';
 
-                 // **关键修改：检测合并冲突并返回特定错误**
-                 if (stderr.toLowerCase().includes('merge conflict') || stderr.toLowerCase().includes('automatic merge failed')) {
-                     userMessage = '合并冲突！请选择解决方案或手动处理。';
-                      console.warn('[data-sync] Manual Pull resulted in merge conflict');
-                      // 返回 409 Conflict 状态码和特定错误类型
-                      return res.status(409).json({ error: 'merge_conflict', message: userMessage });
-                 }
-                 // 其他错误处理... (保持之前的认证错误等判断)
-                 else if (stderr.toLowerCase().includes('authentication failed') || stderr.toLowerCase().includes('could not read username') || stderr.toLowerCase().includes('permission denied') || stderr.toLowerCase().includes('repository not found')) {
-                     userMessage = 'GitHub认证失败或仓库地址错误。请检查Token权限、仓库URL或重新设置Token。';
-                     console.error('Pull failed due to potential auth/repo issue:', stderr);
-                     return res.status(401).json({ message: userMessage });
-                 }
-                 // 返回通用错误
+                // 检测合并冲突并返回特定错误
+                if (result.error === 'merge_conflict' || 
+                    stderr.toLowerCase().includes('merge conflict') || 
+                    stderr.toLowerCase().includes('automatic merge failed')) {
+                    userMessage = '合并冲突！请选择解决方案。';
+                    console.warn('[data-sync] Manual Pull resulted in merge conflict');
+                    // 返回 409 Conflict 状态码和特定错误类型
+                    return res.status(409).json({ error: 'merge_conflict', message: userMessage });
+                }
+                // 其他错误处理... (保持之前的认证错误等判断)
+                else if (stderr.toLowerCase().includes('authentication failed') || stderr.toLowerCase().includes('could not read username') || stderr.toLowerCase().includes('permission denied') || stderr.toLowerCase().includes('repository not found')) {
+                    userMessage = 'GitHub认证失败或仓库地址错误。请检查Token权限、仓库URL或重新设置Token。';
+                    console.error('Pull failed due to potential auth/repo issue:', stderr);
+                    return res.status(401).json({ message: userMessage });
+                }
+                // 返回通用错误
                 res.status(400).json({ message: userMessage, details: result.details || stderr });
             }
         } catch (error) {
             console.error('从远程同步错误 (手动):', error);
             res.status(500).json({ message: '从远程同步时发生内部错误: ' + error.message });
+        }
+    });
+
+    // 新增 API 端点 - 强制以远程覆盖本地 (覆盖现有的本地更改)
+    router.post('/git/sync/force-overwrite-local', async (req, res) => {
+        try {
+            console.log('收到强制覆盖本地请求 (手动按钮 或 合并冲突解决)');
+            
+            // 创建快照用于撤销
+            const snapshotCreated = await createSyncSnapshot('force-pull');
+            
+            const result = await syncFromRemote(); // 使用原有的强制覆盖函数
+            
+            if (result.success) {
+                const config = await readConfig();
+                config.last_sync = new Date().toISOString();
+                await saveConfig(config);
+                res.json({ 
+                    success: true, 
+                    message: '已成功用远程内容覆盖本地', 
+                    undoAvailable: snapshotCreated // 返回快照创建状态
+                });
+            } else {
+                res.status(400).json({ 
+                    success: false, 
+                    message: '强制覆盖本地失败: ' + (result.message || '未知错误'),
+                    details: result.details || result.stderr || result.error || ''
+                });
+            }
+        } catch (error) {
+            console.error('强制覆盖本地错误:', error);
+            res.status(500).json({ message: '强制覆盖本地时发生内部错误: ' + error.message });
+        }
+    });
+
+    // 新增 API 端点 - 强制以本地覆盖远程 (强制推送)
+    router.post('/git/sync/force-overwrite-remote', async (req, res) => {
+        try {
+            console.log('收到强制覆盖远程请求 (手动按钮 或 合并冲突解决)');
+
+            // 创建快照用于撤销
+            const snapshotCreated = await createSyncSnapshot('force-push');
+            
+            const result = await forceOverwriteRemote();
+            
+            if (result.success) {
+                const config = await readConfig();
+                config.last_sync = new Date().toISOString();
+                await saveConfig(config);
+                res.json({ 
+                    success: true, 
+                    message: '已成功用本地内容覆盖远程', 
+                    undoAvailable: snapshotCreated // 返回快照创建状态
+                });
+            } else {
+                res.status(400).json({ 
+                    success: false, 
+                    message: '强制覆盖远程失败: ' + (result.message || '未知错误'),
+                    details: result.details || result.stderr || result.error || ''
+                });
+            }
+        } catch (error) {
+            console.error('强制覆盖远程错误:', error);
+            res.status(500).json({ message: '强制覆盖远程时发生内部错误: ' + error.message });
         }
     });
 
@@ -714,7 +997,7 @@ async function init(router) {
             } else {
                 const errorBody = await validationResponse.text();
                 console.error('无效的GitHub token:', validationResponse.status, errorBody);
-                res.status(401).json({ message: 'GitHub Token无效或权限不足' });
+                res.status(400).json({ message: 'GitHub Token无效或权限不足' });
             }
         } catch (error) {
             console.error('设置GitHub Token错误:', error);
@@ -778,6 +1061,42 @@ async function init(router) {
         }
     });
 
+    // 新增 API 端点 - 撤销上次同步操作
+    router.post('/undo-sync', async (req, res) => {
+        try {
+            console.log('收到撤销同步请求');
+            const result = await restoreFromSnapshot();
+            
+            if (result.success) {
+                res.json({ 
+                    success: true, 
+                    message: result.message, 
+                    operation: result.operation 
+                });
+            } else {
+                res.status(400).json({ 
+                    success: false, 
+                    message: result.message || '撤销操作失败',
+                    details: result.details || ''
+                });
+            }
+        } catch (error) {
+            console.error('撤销同步错误:', error);
+            res.status(500).json({ message: '撤销同步时发生内部错误: ' + error.message });
+        }
+    });
+    
+    // 新增 API 端点 - 检查撤销可用性
+    router.get('/undo-availability', async (req, res) => {
+        try {
+            const result = await checkUndoAvailability();
+            res.json(result);
+        } catch (error) {
+            console.error('检查撤销可用性错误:', error);
+            res.status(500).json({ message: '检查撤销可用性时发生内部错误: ' + error.message });
+        }
+    });
+
     // 插件加载时，根据配置启动自动同步（如果需要）
     const initialConfig = await readConfig();
     if (initialConfig.auto_sync && initialConfig.sync_interval > 0) {
@@ -793,6 +1112,119 @@ async function exit() {
     // 清理操作 - 停止定时任务
     stopAutoSync();
     return Promise.resolve();
+}
+
+// 创建同步快照
+async function createSyncSnapshot(operation) {
+    try {
+        console.log(`[data-sync] Creating snapshot before ${operation}`);
+        lastSyncOperation = operation;
+        
+        // 获取当前提交的哈希
+        const revParseResult = await runGitCommand('git rev-parse HEAD');
+        if (!revParseResult.success) {
+            console.error('[data-sync] Failed to get current HEAD hash:', revParseResult.stderr);
+            return false;
+        }
+        
+        const currentHead = revParseResult.stdout.trim();
+        
+        // 使用 git stash create 来捕获工作区状态（包括未追踪文件）
+        // 注意：这不会修改工作区或索引
+        const stashCreateResult = await runGitCommand('git stash create "SYNC_SNAPSHOT_STASH"');
+        
+        // stashCreateResult.stdout 包含 stash commit 的哈希，如果创建了 stash
+        // 如果没有更改，stdout 为空
+        const stashCommitHash = stashCreateResult.stdout.trim();
+        const hasStashedChanges = !!stashCommitHash;
+        
+        // 保存快照信息
+        lastSyncSnapshot = {
+            head: currentHead,
+            timestamp: new Date().toISOString(),
+            operation: operation,
+            // 如果有 stash，记录 stash commit hash，否则为 null
+            stashCommit: hasStashedChanges ? stashCommitHash : null,
+            hasChanges: hasStashedChanges // 表示工作区是否有更改被存入 stash
+        };
+        
+        console.log(`[data-sync] Snapshot created: ${JSON.stringify(lastSyncSnapshot)}`);
+        return true;
+    } catch (error) {
+        console.error('[data-sync] Error creating snapshot:', error);
+        lastSyncSnapshot = null;
+        return false;
+    }
+}
+
+// 从快照恢复
+async function restoreFromSnapshot() {
+    if (!lastSyncSnapshot) {
+        return { success: false, message: 'No snapshot available for undo' };
+    }
+    
+    try {
+        console.log(`[data-sync] Restoring from snapshot: ${JSON.stringify(lastSyncSnapshot)}`);
+        
+        // 无论 push 还是 pull，撤销都是恢复到同步前的本地状态
+        
+        // 1. 重置 HEAD 到快照时的提交
+        const resetResult = await runGitCommand(`git reset --hard ${lastSyncSnapshot.head}`);
+        if (!resetResult.success) {
+            return { success: false, message: 'Failed to reset to snapshot commit', details: resetResult };
+        }
+        
+        // 2. 如果快照包含了工作区更改，应用 stash
+        if (lastSyncSnapshot.hasChanges && lastSyncSnapshot.stashCommit) {
+            console.log(`[data-sync] Applying snapshot stash: ${lastSyncSnapshot.stashCommit}`);
+            // 使用 stash apply 来恢复状态，而不是 stash pop，以防失败时 stash 丢失
+            const applyResult = await runGitCommand(`git stash apply ${lastSyncSnapshot.stashCommit}`);
+            
+            if (!applyResult.success) {
+                // 如果 stash apply 失败 (可能有冲突)
+                console.warn('[data-sync] Failed to apply snapshot stash automatically. Changes remain in stash.');
+                // 获取冲突状态信息，但不需要在这里详细处理
+                // const statusAfterApplyFail = await runGitCommand('git status');
+                
+                return { 
+                    success: false, 
+                    message: 'Restored to previous commit, but failed to automatically restore working changes (possible conflicts). Changes are still in the stash. Please resolve manually.',
+                    error: 'stash_apply_failed',
+                    details: applyResult 
+                };
+            }
+            // 如果 apply 成功，我们不需要手动删除 stash 记录，因为 stash create 本身不影响栈
+            // 如果希望清理，可以使用 `git stash drop <stash_commit_hash>`
+            // 但通常保留它作为备份更好，或者让用户决定
+        }
+        
+        // 撤销成功
+        console.log('[data-sync] Successfully restored state from snapshot.');
+        
+        const result = {
+            success: true,
+            message: `Successfully undid the last ${lastSyncOperation} operation`,
+            operation: lastSyncOperation
+        };
+        
+        // 清除内存中的快照信息
+        lastSyncSnapshot = null;
+        lastSyncOperation = null;
+        
+        return result;
+    } catch (error) {
+        console.error('[data-sync] Error restoring from snapshot:', error);
+        return { success: false, message: `Error during undo: ${error.message}` };
+    }
+}
+
+// 检查是否有可撤销的操作
+async function checkUndoAvailability() {
+    return {
+        available: lastSyncSnapshot !== null,
+        operation: lastSyncOperation,
+        timestamp: lastSyncSnapshot ? lastSyncSnapshot.timestamp : null
+    };
 }
 
 // 导出插件
